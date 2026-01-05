@@ -1,0 +1,13 @@
+*.xyz
+*.traj
+venv/
+*.inp
+Runs/
+neb/
+**test**
+relaxations/
+styrene
+.xtboptok
+*.log
+*.txt
+.DS_Store
