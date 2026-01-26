@@ -26,6 +26,7 @@ reactants:
         site_type: "aryl_CBr"
 
 settings:
+  sample_size: 10
   bond_formation:
     atom_pairs:
       - [catalyst, substrate]

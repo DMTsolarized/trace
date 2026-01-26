@@ -8,10 +8,7 @@ def unit(v):
 
 
 def signed_angle_between(u, v, axis):
-    """
-    Signed angle (radians) from u to v about axis (right-hand rule).
-    Result in (-pi, pi].
-    """
+
     u_n = unit(u)
     v_n = unit(v)
     cross = np.cross(u_n, v_n)
@@ -24,6 +21,7 @@ def is_approach_inside_bite(
     pre_complex: Atoms, pd_idx, approach, tolerance_deg=1.0, verbose=False
 ):
     """
+    THINK ABOUT REMOVING THIS THING
     Return (inside:bool, info:dict)
 
     - pre_complex: ASE Atoms containing Pd and P donors

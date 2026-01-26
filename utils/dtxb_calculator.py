@@ -33,9 +33,9 @@ class DXTBCalculator(Calculator):
         Parameters
         ----------
         method : "GFN1" or "GFN2"
-            Which dxtb parametrization to use.
+            Which dxtb parametrization to use. GFN2 only available on LINUX
         device : "cpu" or "cuda" or torch.device
-            Torch device for tensors.
+            Torch device for tensors. Does not work on MacOS GPU sadly
         dtype : torch.dtype
             Torch dtype for positions (float).
         opts : dict | None
@@ -82,10 +82,6 @@ class DXTBCalculator(Calculator):
         return self._calc
 
     def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
-        """
-        ASE-required calculate method.
-        Requests contain property names in `properties`.
-        """
         super().calculate(atoms, properties, system_changes)
 
         if atoms is None:

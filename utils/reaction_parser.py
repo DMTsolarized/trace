@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import io
+import importlib
 import os
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, Literal
 
 from ase import Atoms
+from ase.calculators.calculator import BaseCalculator
 from ase.io import read as ase_read
 import yaml
+from ase.optimize.optimize import Optimizer
+
+
+def _default_optimizer() -> type[Optimizer]:
+    return getattr(importlib.import_module("ase.optimize"), "LBFGS")
 
 
 class ValidationError(ValueError):
@@ -23,6 +30,28 @@ class ReactantType(str, Enum):
 
 
 REACTANT_TYPES_DEFAULT = {item.value for item in ReactantType}
+
+
+class CalculatorType(str, Enum):
+    DXTB = "dxtb"
+    ORCA = "orca"
+
+
+CALCULATOR_TYPES_DEFAULT = {item.value for item in CalculatorType}
+
+
+def _default_calculator_factory() -> (
+    Callable[[Optional[dict[str, Any]]], BaseCalculator]
+):
+    from utils.dtxb_calculator import DXTBCalculator
+
+    def _factory(overrides: Optional[dict[str, Any]] = None) -> BaseCalculator:
+        merged_options: dict[str, Any] = {}
+        if overrides:
+            merged_options.update(overrides)
+        return DXTBCalculator(**merged_options)
+
+    return _factory
 
 
 @dataclass(frozen=True)
@@ -45,6 +74,7 @@ class MetalCenter:
 class Ligand:
     name: str
     count: int
+    smicat: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -70,7 +100,9 @@ class Reactant:
 @dataclass(frozen=True)
 class BondFormationSettings:
     atom_pairs: list[tuple[str, str]] = field(default_factory=list)
-    distance_scale: Optional[float] = None
+    distance_scale: float = 1.35
+    distance_range: tuple[float, float] = (0.9, 1.1)
+    distances: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -81,22 +113,38 @@ class SamplingSettings:
 
 @dataclass(frozen=True)
 class OptimizationSettings:
-    relax: bool = False
-    max_steps: Optional[int] = None
+    optimizer: type[Optimizer] = field(default_factory=_default_optimizer)
+    optimizer_name: str = "LBFGS"
+    optimizer_module: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CalculatorSettings:
+    name: str
+    steps: int = 10
+    fmax: float = 0.5
+    options: dict[str, Any] = field(default_factory=dict)
+    calculator_factory: Callable[[Optional[dict[str, Any]]], BaseCalculator] = field(
+        default_factory=_default_calculator_factory
+    )
+    move: Literal[False] | dict[str, float | str] = False
 
 
 @dataclass(frozen=True)
 class ReactionSettings:
+    sample_size: int
     bond_formation: Optional[BondFormationSettings] = None
     sampling: Optional[SamplingSettings] = None
-    optimization: Optional[OptimizationSettings] = None
+    optimization: OptimizationSettings = field(default_factory=OptimizationSettings)
 
 
 @dataclass(frozen=True)
 class ReactionDefinition:
     reaction: Reaction
     reactants: list[Reactant]
+    workdir: str
     settings: ReactionSettings = field(default_factory=ReactionSettings)
+    pipeline: list[CalculatorSettings] = field(default_factory=list)
 
 
 def load_reaction_from_file(
@@ -151,13 +199,22 @@ def parse_reaction_dict(
     reaction_data = _require_mapping(data, "reaction")
     reaction = _parse_reaction(reaction_data, reaction_types_set)
 
+    workdir = _require_str(data, "workdir", "workdir")
+
     reactants_data = _require_list(data, "reactants")
     reactants = _parse_reactants(reactants_data, reactant_types_set, base_dir)
 
     settings_data = data.get("settings")
     settings = _parse_settings(settings_data)
+    pipeline = _parse_pipeline(data.get("pipeline"))
 
-    return ReactionDefinition(reaction=reaction, reactants=reactants, settings=settings)
+    return ReactionDefinition(
+        reaction=reaction,
+        reactants=reactants,
+        workdir=workdir,
+        settings=settings,
+        pipeline=pipeline,
+    )
 
 
 def _parse_reaction(
@@ -268,13 +325,15 @@ def _parse_ligands(ligands_data: object, path: str) -> list[Ligand]:
         raise ValidationError(f"{path} must be a list.")
 
     ligands: list[Ligand] = []
+
     for idx, ligand_data in enumerate(ligands_data):
         ligand_path = f"{path}[{idx}]"
         if not isinstance(ligand_data, dict):
             raise ValidationError(f"{ligand_path} must be a mapping.")
         name = _require_str(ligand_data, "name", f"{ligand_path}.name")
         count = _require_int(ligand_data, "count", f"{ligand_path}.count")
-        ligands.append(Ligand(name=name, count=count))
+        smicat = _optional_int(ligand_data.get("smicat"), f"{ligand_path}.smicat")
+        ligands.append(Ligand(name=name, count=count, smicat=smicat))
 
     return ligands
 
@@ -332,9 +391,11 @@ def _parse_reactive_centers(centers_data: object, path: str) -> list[ReactiveSit
 
 def _parse_settings(settings_data: object) -> ReactionSettings:
     if settings_data is None:
-        return ReactionSettings()
+        raise ValidationError("Missing required field: settings.sample_size")
     if not isinstance(settings_data, dict):
         raise ValidationError("settings must be a mapping.")
+
+    sample_size = _require_int(settings_data, "sample_size", "settings.sample_size")
 
     bond_formation = None
     if "bond_formation" in settings_data:
@@ -347,12 +408,116 @@ def _parse_settings(settings_data: object) -> ReactionSettings:
     optimization = None
     if "optimization" in settings_data:
         optimization = _parse_optimization(settings_data.get("optimization"))
+    else:
+        optimization = _parse_optimization({})
 
     return ReactionSettings(
+        sample_size=sample_size,
         bond_formation=bond_formation,
         sampling=sampling,
         optimization=optimization,
     )
+
+
+def _parse_pipeline(data: object) -> list[CalculatorSettings]:
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise ValidationError("pipeline must be a list.")
+
+    calculators: list[CalculatorSettings] = []
+    for idx, entry in enumerate(data):
+        entry_path = f"pipeline[{idx}]"
+        if not isinstance(entry, dict):
+            raise ValidationError(f"{entry_path} must be a mapping.")
+        name = _require_str(entry, "name", f"{entry_path}.name")
+        _validate_no_spaces(name, f"{entry_path}.name")
+        name_norm = name.strip().lower()
+        _validate_enum(name_norm, CALCULATOR_TYPES_DEFAULT, f"{entry_path}.name")
+        steps = _optional_int(entry.get("steps"), f"{entry_path}.steps") or 10
+        fmax = _optional_float(entry.get("fmax"), f"{entry_path}.fmax") or 0.5
+        move = _parse_calculator_move(entry.get("move"), f"{entry_path}.move")
+        options_raw = entry.get("options", {})
+        if options_raw is None:
+            options_raw = {}
+        if not isinstance(options_raw, dict):
+            raise ValidationError(f"{entry_path}.options must be a mapping.")
+        calculator_factory = _build_calculator_factory(
+            name_norm,
+            options_raw,
+            entry_path,
+        )
+        calculators.append(
+            CalculatorSettings(
+                name=name_norm,
+                steps=steps,
+                fmax=fmax,
+                options=options_raw,
+                calculator_factory=calculator_factory,
+                move=move,
+            )
+        )
+    return calculators
+
+
+def _build_calculator(
+    name: str,
+    options: dict[str, Any],
+    path: str,
+) -> BaseCalculator:
+    if name == CalculatorType.DXTB.value:
+        from utils.dtxb_calculator import DXTBCalculator
+
+        return DXTBCalculator(**options)
+    if name == CalculatorType.ORCA.value:
+        try:
+            from ase.calculators.orca import ORCA
+        except Exception as exc:  # pragma: no cover - depends on environment
+            raise ValidationError(
+                f"Failed to import ORCA calculator for {path}: {exc}"
+            ) from exc
+        return ORCA(**options)
+    raise ValidationError(f"Unsupported calculator '{name}' for {path}.")
+
+
+def _build_calculator_factory(
+    name: str,
+    options: dict[str, Any],
+    path: str,
+) -> Callable[[Optional[dict[str, Any]]], BaseCalculator]:
+    def _factory(overrides: Optional[dict[str, Any]] = None) -> BaseCalculator:
+        merged_options = dict(options)
+        if overrides:
+            merged_options.update(overrides)
+        return _build_calculator(name, merged_options, path)
+
+    return _factory
+
+
+def _parse_calculator_move(
+    value: object,
+    path: str,
+) -> Literal[False] | dict[str, float | str]:
+    if value is None or value is False:
+        return False
+    if value is True:
+        raise ValidationError(f"{path} must be false or a mapping.")
+    if not isinstance(value, dict):
+        raise ValidationError(f"{path} must be false or a mapping.")
+    start = _optional_float_or_auto(value.get("start"), f"{path}.start")
+    target = _optional_float_or_auto(value.get("target"), f"{path}.target")
+    step = _optional_float_or_auto(value.get("step"), f"{path}.step")
+    return {"start": start, "target": target, "step": step}
+
+
+def _optional_float_or_auto(value: object, path: str) -> float | str:
+    if value is None:
+        raise ValidationError(f"{path} is required when move is a mapping.")
+    if isinstance(value, str):
+        if value != "auto":
+            raise ValidationError(f"{path} must be a number or 'auto'.")
+        return value
+    return _ensure_float(value, path)
 
 
 def _parse_bond_formation(data: object) -> Optional[BondFormationSettings]:
@@ -374,11 +539,47 @@ def _parse_bond_formation(data: object) -> Optional[BondFormationSettings]:
             right = _ensure_str(pair[1], f"{pair_path}[1]")
             atom_pairs.append((left, right))
 
-    distance_scale = _optional_float(
-        data.get("distance_scale"), "settings.bond_formation.distance_scale"
+    distance_scale = (
+        _optional_float(
+            data.get("distance_scale"), "settings.bond_formation.distance_scale"
+        )
+        or 1.35
     )
 
-    return BondFormationSettings(atom_pairs=atom_pairs, distance_scale=distance_scale)
+    distance_range_raw = data.get("distance_range")
+    distance_range = (0.9, 1.1)
+    if distance_range_raw is not None:
+        if not isinstance(distance_range_raw, list) or len(distance_range_raw) != 2:
+            raise ValidationError(
+                "settings.bond_formation.distance_range must be a 2-item list."
+            )
+        distance_range = (
+            _ensure_float(
+                distance_range_raw[0],
+                "settings.bond_formation.distance_range[0]",
+            ),
+            _ensure_float(
+                distance_range_raw[1],
+                "settings.bond_formation.distance_range[1]",
+            ),
+        )
+
+    distances_raw = data.get("distances")
+    distances: list[float] = []
+    if distances_raw is not None:
+        if not isinstance(distances_raw, list):
+            raise ValidationError("settings.bond_formation.distances must be a list.")
+        distances = [
+            _ensure_float(item, f"settings.bond_formation.distances[{idx}]")
+            for idx, item in enumerate(distances_raw)
+        ]
+
+    return BondFormationSettings(
+        atom_pairs=atom_pairs,
+        distance_scale=distance_scale,
+        distance_range=distance_range,
+        distances=distances,
+    )
 
 
 def _parse_sampling(data: object) -> Optional[SamplingSettings]:
@@ -401,16 +602,66 @@ def _parse_sampling(data: object) -> Optional[SamplingSettings]:
     return SamplingSettings(rotations=rotations, rotation_angles=rotation_angles)
 
 
-def _parse_optimization(data: object) -> Optional[OptimizationSettings]:
+def _parse_optimization(data: object) -> OptimizationSettings:
     if data is None:
-        return None
+        data = {}
     if not isinstance(data, dict):
         raise ValidationError("settings.optimization must be a mapping.")
 
-    relax = _optional_bool(data.get("relax"), "settings.optimization.relax")
-    max_steps = _optional_int(data.get("max_steps"), "settings.optimization.max_steps")
+    optimizer_name = "LBFGS"
+    optimizer_module = None
+    optimizer_data = data.get("optimizer")
+    if optimizer_data is not None:
+        if isinstance(optimizer_data, str):
+            optimizer_name = _ensure_str(
+                optimizer_data,
+                "settings.optimization.optimizer",
+            )
+        elif isinstance(optimizer_data, dict):
+            optimizer_name = _require_str(
+                optimizer_data,
+                "name",
+                "settings.optimization.optimizer.name",
+            )
+            optimizer_module = _optional_str(
+                optimizer_data.get("module"),
+                "settings.optimization.optimizer.module",
+            )
+        else:
+            raise ValidationError(
+                "settings.optimization.optimizer must be a string or mapping."
+            )
+    optimizer = _load_optimizer(
+        optimizer_name,
+        optimizer_module,
+        "settings.optimization.optimizer",
+    )
 
-    return OptimizationSettings(relax=relax, max_steps=max_steps)
+    return OptimizationSettings(
+        optimizer_name=optimizer_name,
+        optimizer_module=optimizer_module,
+        optimizer=optimizer,
+    )
+
+
+def _load_optimizer(
+    name: str,
+    module: Optional[str],
+    path: str,
+) -> type[Optimizer]:
+    module_name = module or "ase.optimize"
+    try:
+        optimizer_module = importlib.import_module(module_name)
+    except Exception as exc:
+        raise ValidationError(
+            f"Failed to import optimizer module '{module_name}' for {path}: {exc}"
+        ) from exc
+    try:
+        return getattr(optimizer_module, name)
+    except AttributeError as exc:
+        raise ValidationError(
+            f"Optimizer '{name}' not found in module '{module_name}' for {path}."
+        ) from exc
 
 
 def _parse_xyz_atoms(
@@ -463,8 +714,13 @@ def _generate_molsimplify_xyz(
     cmd_dict["-geometry"] = metal.geometry.lower()
     cmd_dict["-coord"] = str(metal.coordination)
     if ligands:
-        cmd_dict["-lig"] = ",".join(ligand.name.lower() for ligand in ligands)
+        cmd_dict["-lig"] = ",".join(ligand.name for ligand in ligands)
         cmd_dict["-ligocc"] = ",".join(str(ligand.count) for ligand in ligands)
+        smicats = [
+            str(ligand.smicat) for ligand in ligands if ligand.smicat is not None
+        ]
+        if smicats:
+            cmd_dict["-smicat"] = f"[{','.join(smicats)}]"
     cmd_dict["-spin"] = str(metal.spin)
     cmd_dict["-oxstate"] = str(metal.oxidation_state)
 

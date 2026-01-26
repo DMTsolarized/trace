@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ase.io import read, write
 from ase.optimize import BFGS
+from ase.constraints import FixBondLength, Hookean
 import torch
 
 from utils.dtxb_calculator import DXTBCalculator
@@ -22,10 +23,11 @@ def relax_oa_guess(
     outfile = Path(outfile)
 
     atoms = read(infile)
+    atoms.set_constraint([Hookean(0, 70, 10, 3.3)])
     atoms.calc = DXTBCalculator(method=method)
     opt = BFGS(atoms, trajectory=str(Path(outfile).with_suffix(".traj")))
-    opt.run(fmax=fmax)
-
+    opt.run(fmax=fmax, steps=10)
+    atoms.set_constraint([])
     write(outfile, atoms)
     print(f"Wrote relaxed structure to {outfile}")
 

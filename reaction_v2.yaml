@@ -1,3 +1,4 @@
+workdir: "v2/third"
 reaction:
   name: "Pd Heck coupling"
   type: "oxidative_addition"
@@ -36,17 +37,28 @@ settings:
 
 pipeline:
   - name: "DXTB"
-    steps: 20
+    steps: 10
+    fmax: 0.5
     options:
       method: "GFN1"
       spin: 0
-  - name: "ORCA"
-    steps: 5
+  - name: "DXTB"
+    steps: 100
+    fmax: 0.5
     options:
-      command: "orca"
-      charge: 0
-      mult: 1
-      orcasimpleinput: 'r2SCAN-3c TightSCF ENGRAD'
-      orcablocks: '%pal nprocs 10 end'
-      task: "gradient"
-      directory: 'orca'
+      method: "GFN1"
+      spin: 0
+    move:
+      start: 'auto'
+      target: 'auto'
+      step: 0.1
+  # - name: "ORCA"
+  #   steps: 10
+  #   options:
+  #     command: "orca"
+  #     charge: 0
+  #     mult: 1
+  #     orcasimpleinput: 'r2SCAN-3c TightSCF ENGRAD'
+  #     orcablocks: '%pal nprocs 10 end'
+  #     task: "gradient"
+  #     directory: 'orca'

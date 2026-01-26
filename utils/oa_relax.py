@@ -14,7 +14,7 @@ def relax_oa_guess(
     method: str = "GFN1",
     fmax: float = 0.02,
 ) -> None:
-    """Relax an oxidative-addition guess with GFN1 to the requested fmax."""
+    """Helper consider removing"""
     infile = Path(infile)
     if outfile is None:
         outfile = infile.with_stem(infile.stem + "_relaxed")

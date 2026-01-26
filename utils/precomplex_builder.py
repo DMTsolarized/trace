@@ -97,6 +97,11 @@ class ApproachGenerator:
     def generate(self, atoms: Atoms, site: ReactiveSite) -> List[np.ndarray]:
         raise NotImplementedError
 
+    def anchor_point(
+        self, atoms: Atoms, site: ReactiveSite
+    ) -> Optional[np.ndarray]:
+        return None
+
 
 class BondSigmaStarApproach(ApproachGenerator):
     """
@@ -113,6 +118,33 @@ class BondSigmaStarApproach(ApproachGenerator):
         pos = atoms.get_positions()
         v = pos[site.partner_idx] - pos[site.atom_idx]  # A -> B
         return [unit(-v)]  # opposite direction (toward sigma*)
+
+
+class BondMidpointApproach(ApproachGenerator):
+    """
+    Approach along the perp axis of a bond: 90deg of (A -> B) vector.
+    For a site defined by (atom_idx = A, partner_idx = B), we approach the
+    midpoint between A and B along a perpendicular direction.
+
+    """
+
+    def generate(self, atoms: Atoms, site: ReactiveSite) -> List[np.ndarray]:
+        if site.partner_idx is None:
+            raise ValueError("BondMidpointApproach requires site.partner_idx")
+        pos = atoms.get_positions()
+        bond_unit = unit(pos[site.partner_idx] - pos[site.atom_idx])
+        ref = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(ref, bond_unit)) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0])
+        perp_a = unit(np.cross(bond_unit, ref))
+        perp_b = unit(np.cross(bond_unit, perp_a))
+        return [bond_unit, -bond_unit, perp_a, -perp_a, perp_b, -perp_b]
+
+    def anchor_point(self, atoms: Atoms, site: ReactiveSite) -> Optional[np.ndarray]:
+        if site.partner_idx is None:
+            return None
+        pos = atoms.get_positions()
+        return 0.5 * (pos[site.atom_idx] + pos[site.partner_idx])
 
 
 class PiFaceApproach(ApproachGenerator):
@@ -233,6 +265,7 @@ class EnergyScorer:
     """
     Optional single-point energy annotation using DXTBCalculator.
     Not used for ranking by default.
+    maybe remove, since I dont rank this just eats up wall time
     """
 
     def __init__(self, method: str = "GFN1", spin: Optional[int] = None):
@@ -732,32 +765,49 @@ class PrecomplexSampler:
 
         candidates = []
 
-        # Collect approach vectors from all generators
-        approaches: List[np.ndarray] = []
+        # Collect approach vectors from all generators (with optional anchors)
+        approaches: List[tuple[np.ndarray, Optional[np.ndarray]]] = []
         for gen in self.approach_gens:
-            approaches.extend(gen.generate(self.fragB0, self.siteB))
+            anchor = gen.anchor_point(self.fragB0, self.siteB)
+            for vec in gen.generate(self.fragB0, self.siteB):
+                approaches.append((vec, anchor))
+
+        def anchors_close(
+            a: Optional[np.ndarray], b: Optional[np.ndarray], tol: float
+        ) -> bool:
+            if a is None and b is None:
+                return True
+            if a is None or b is None:
+                return False
+            return np.linalg.norm(a - b) < tol
 
         def unique_vectors(
-            vecs: List[np.ndarray], tol: float = 1e-3
-        ) -> List[np.ndarray]:
-            out: List[np.ndarray] = []
-            for v in vecs:
-                if not any(np.linalg.norm(v - u) < tol for u in out):
-                    out.append(v)
+            vecs: List[tuple[np.ndarray, Optional[np.ndarray]]], tol: float = 1e-3
+        ) -> List[tuple[np.ndarray, Optional[np.ndarray]]]:
+            out: List[tuple[np.ndarray, Optional[np.ndarray]]] = []
+            for v, anchor in vecs:
+                if not any(
+                    np.linalg.norm(v - u) < tol and anchors_close(anchor, a, tol)
+                    for u, a in out
+                ):
+                    out.append((v, anchor))
             return out
 
         approaches = unique_vectors(approaches)
 
-        for approach in approaches:
+        for approach, anchor in approaches:
             inside, _ = is_approach_inside_bite(
                 self.fragA0, self.siteA.atom_idx, approach
+            )
+            anchor_point = (
+                anchor if anchor is not None else fragB_pos[self.siteB.atom_idx]
             )
 
             for d in self.distances:
                 at_pos = fragA_pos0.copy()
 
-                # place siteA at siteB + approach * d
-                target = fragB_pos[self.siteB.atom_idx] + approach * d
+                # place siteA at anchor + approach * d
+                target = anchor_point + approach * d
                 self.translate_to_target(at_pos, self.siteA.atom_idx, target)
 
                 # align A_site -> B_site with approach direction
@@ -765,17 +815,23 @@ class PrecomplexSampler:
                     at_pos,
                     self.siteA.atom_idx,
                     approach,
-                    fragB_pos[self.siteB.atom_idx],
+                    anchor_point,
                 )
 
                 clash_score, max_ov, n_ov = self.evaluate_candidate(at_pos)
-                align_s = alignment_score(
-                    at_pos,
-                    self.siteA.atom_idx,
-                    fragB_pos,
-                    self.siteB.atom_idx,
-                    approach,
-                )
+                if anchor is None:
+                    align_s = alignment_score(
+                        at_pos,
+                        self.siteA.atom_idx,
+                        fragB_pos,
+                        self.siteB.atom_idx,
+                        approach,
+                    )
+                else:
+                    actual = unit(at_pos[self.siteA.atom_idx] - anchor_point)
+                    ideal = unit(approach)
+                    dot = float(np.clip(np.dot(actual, ideal), -1.0, 1.0))
+                    align_s = 1.0 - dot
 
                 candidates.append(
                     {

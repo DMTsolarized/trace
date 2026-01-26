@@ -10,7 +10,8 @@ from ase.calculators.lj import LennardJones
 from utils.dtxb_calculator import DXTBCalculator
 
 
-atoms_pre = read("dimer.traj", index=":")
+atoms_pre = read("v2/oa/product_0_orca_final_relaxed.traj", index=":")
 lsat_frame_2 = atoms_pre[-1]
+lsat_frame_2.set_constraint([])
 
-write("dimer_last.xyz", lsat_frame_2)
+write("0.02_orca_last.xyz", lsat_frame_2)

@@ -11,3 +11,5 @@ styrene
 *.log
 *.txt
 .DS_Store
+orca/
+libmpi.*
