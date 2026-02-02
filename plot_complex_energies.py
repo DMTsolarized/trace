@@ -12,7 +12,13 @@ from utils.dtxb_calculator import DXTBCalculator
 
 
 def main() -> None:
-    pattern = os.path.join("v2", "third", "walk_4_atoms_*.xyz")
+    pattern = os.path.join(
+        "v2",
+        "sample_tests_ni",
+        "walk-tug",
+        "step",
+        "cand_2_step_*.xyz",
+    )
 
     def natural_key(path: str) -> list[object]:
         basename = os.path.basename(path)

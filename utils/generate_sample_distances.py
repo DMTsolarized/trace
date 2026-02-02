@@ -1,5 +1,5 @@
 from ase.data import covalent_radii
-from utils.reaction_parser import BondFormationSettings
+from runner.reaction_parser import BondFormationSettings
 import numpy as np
 from typing import Generator
 from ase import Atoms
@@ -16,7 +16,7 @@ def generate_dynamic_distances_for_sample(
 ):
     bond_length: float = get_covalent_bond_length(numbers) * settings.distance_scale
     range_low, range_top = settings.distance_range
-    return np.linspace(bond_length * range_low, bond_length * range_top, 5)
+    return np.linspace(bond_length * range_low, bond_length * range_top, 10)
 
 
 def recover_indices_from_merged_complex(

@@ -13,3 +13,6 @@ styrene
 .DS_Store
 orca/
 libmpi.*
+__pycache__
+images/
+v2/

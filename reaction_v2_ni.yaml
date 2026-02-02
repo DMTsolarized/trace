@@ -1,4 +1,4 @@
-workdir: "v2/sample_tests_translate_both_bigger_relax_harm"
+workdir: "v2/sample_tests_ni"
 reaction:
   name: "Pd Heck coupling"
   type: oxidative_addition
@@ -8,7 +8,7 @@ reactants:
   - id: catalyst
     type: organometallic
     metal:
-      element: Pd
+      element: Ni
       oxidation_state: 0
       spin: 0
       coordination: 2
@@ -31,7 +31,7 @@ settings:
   bond_formation:
     atom_pairs:
       - [catalyst, substrate]
-    distance_scale: 1.25
+    distance_scale: 1.75
   optimization:
     optimizer: "BFGS"
 
@@ -49,16 +49,16 @@ pipeline:
     fmax: 0.02
   - id: sample-space
     action: bi-sample
-    sample: 5
+    sample: 10
   - id: after-sample-relax
     action: relax
     calc: gfn1
     fmax: 0.2
-    steps: 120
+    steps: 100
     filters:
       - name: energy_force
         args:
-          e_cutoff: 30
+          e_cutoff: 40
           fmax_cutoff: 10.0
           e_min: auto
   - id: walk-dock
@@ -124,3 +124,13 @@ pipeline:
           to: 2.9
           step: 0.025
   
+  # - name: "ORCA"
+  #   steps: 10
+  #   options:
+  #     command: "orca"
+  #     charge: 0
+  #     mult: 1
+  #     orcasimpleinput: 'r2SCAN-3c TightSCF ENGRAD'
+  #     orcablocks: '%pal nprocs 10 end'
+  #     task: "gradient"
+  #     directory: 'orca'

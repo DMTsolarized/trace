@@ -1,5 +1,5 @@
 import numpy as np
-from ase import Atoms, units
+from ase import Atoms
 
 # MAYBE USE ASE UNITS
 EV_TO_KCALMOL = 23.06054194532933

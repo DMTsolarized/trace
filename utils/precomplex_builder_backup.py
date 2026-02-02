@@ -8,6 +8,7 @@ from ase.data import covalent_radii
 
 from utils.dtxb_calculator import DXTBCalculator
 from utils.bite_angle import is_approach_inside_bite
+from utils.reactive_site import ReactiveSite
 
 
 # ==========================
@@ -51,42 +52,6 @@ def rotate_points(
     R = rotation_matrix(axis_vec, np.radians(angle_deg))
     for i in idxs:
         pts[i] = axis_point + R @ (pts[i] - axis_point)
-
-
-# ==========================
-# Reactive site abstraction
-# ==========================
-
-
-class ReactiveSite:
-    """
-    General reactive site description.
-
-    Parameters
-    ----------
-    atom_idx : int
-        The "central" reactive atom (e.g. ipso carbon, heteroatom, etc.)
-    partner_idx : Optional[int]
-        Bond partner atom index (e.g. Br in C–Br, H in C–H).
-        Used to define sigma* directions.
-    plane_indices : Optional[List[int]]
-        Indices of atoms defining a local plane (e.g. aromatic ring).
-        Used to define pi-face normals.
-    site_type : str
-        Label for debugging / bookkeeping, no logic attached.
-    """
-
-    def __init__(
-        self,
-        atom_idx: int,
-        partner_idx: Optional[int] = None,
-        plane_indices: Optional[List[int]] = None,
-        site_type: str = "generic",
-    ):
-        self.atom_idx = atom_idx
-        self.partner_idx = partner_idx
-        self.plane_indices = plane_indices or []
-        self.site_type = site_type
 
 
 # ==========================

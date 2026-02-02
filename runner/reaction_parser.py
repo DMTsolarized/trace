@@ -12,6 +12,9 @@ from ase.calculators.calculator import BaseCalculator
 from ase.io import read as ase_read
 import yaml
 from ase.optimize.optimize import Optimizer
+from utils.reactive_site import ReactiveSite
+
+DEFAULT_MAX_STEPS = 100_000_000
 
 
 def _default_optimizer() -> type[Optimizer]:
@@ -54,6 +57,17 @@ def _default_calculator_factory() -> (
     return _factory
 
 
+def _null_calculator_factory() -> (
+    Callable[[Optional[dict[str, Any]]], Optional[BaseCalculator]]
+):
+    def _factory(
+        overrides: Optional[dict[str, Any]] = None,
+    ) -> Optional[BaseCalculator]:
+        return None
+
+    return _factory
+
+
 @dataclass(frozen=True)
 class Reaction:
     name: str
@@ -75,14 +89,6 @@ class Ligand:
     name: str
     count: int
     smicat: Optional[int]
-
-
-@dataclass(frozen=True)
-class ReactiveSite:
-    atom_idx: int
-    partner_idx: Optional[int] = None
-    plane_indices: list[int] = field(default_factory=list)
-    site_type: str = "generic"
 
 
 @dataclass(frozen=True)
@@ -119,15 +125,55 @@ class OptimizationSettings:
 
 
 @dataclass(frozen=True)
-class CalculatorSettings:
+class PipeStage:
+    id: str
+    action: str
     name: str
-    steps: int = 10
+    steps: int = DEFAULT_MAX_STEPS
     fmax: float = 0.5
     options: dict[str, Any] = field(default_factory=dict)
-    calculator_factory: Callable[[Optional[dict[str, Any]]], BaseCalculator] = field(
-        default_factory=_default_calculator_factory
-    )
-    move: Literal[False] | dict[str, float | str] = False
+    calculator_factory: Callable[
+        [Optional[dict[str, Any]]], Optional[BaseCalculator]
+    ] = field(default_factory=_null_calculator_factory)
+    moves: list["MoveSettings"] = field(default_factory=list)
+    filters: list["FilterSpec"] = field(default_factory=list)
+    kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MoveTarget:
+    start: float | str
+    end: float | str
+    step: float | str
+
+
+@dataclass(frozen=True)
+class MoveOffset:
+    start: float | str
+    end: float
+    step: float
+
+
+@dataclass(frozen=True)
+class MovePair:
+    a: str
+    b: str
+
+
+@dataclass(frozen=True)
+class MoveSettings:
+    id: str
+    kind: str
+    pair: MovePair
+    k: int = 100
+    target: Optional[MoveTarget] = None
+    offset: Optional[MoveOffset] = None
+
+
+@dataclass(frozen=True)
+class CalculatorDefinition:
+    engine: str
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -143,8 +189,9 @@ class ReactionDefinition:
     reaction: Reaction
     reactants: list[Reactant]
     workdir: str
-    settings: ReactionSettings = field(default_factory=ReactionSettings)
-    pipeline: list[CalculatorSettings] = field(default_factory=list)
+    settings: ReactionSettings
+    pipeline: list[PipeStage] = field(default_factory=list)
+    calculators: dict[str, CalculatorDefinition] = field(default_factory=dict)
 
 
 def load_reaction_from_file(
@@ -206,7 +253,8 @@ def parse_reaction_dict(
 
     settings_data = data.get("settings")
     settings = _parse_settings(settings_data)
-    pipeline = _parse_pipeline(data.get("pipeline"))
+    calculators = _parse_calculator_definitions(data.get("calculators"))
+    pipeline = _parse_pipeline(data.get("pipeline"), calculators)
 
     return ReactionDefinition(
         reaction=reaction,
@@ -214,6 +262,7 @@ def parse_reaction_dict(
         workdir=workdir,
         settings=settings,
         pipeline=pipeline,
+        calculators=calculators,
     )
 
 
@@ -419,45 +468,125 @@ def _parse_settings(settings_data: object) -> ReactionSettings:
     )
 
 
-def _parse_pipeline(data: object) -> list[CalculatorSettings]:
+def _parse_pipeline(
+    data: object,
+    calculators: dict[str, CalculatorDefinition],
+) -> list[PipeStage]:
     if data is None:
         return []
     if not isinstance(data, list):
         raise ValidationError("pipeline must be a list.")
 
-    calculators: list[CalculatorSettings] = []
+    pipeline: list[PipeStage] = []
+    pipeline_ids: set[str] = set()
     for idx, entry in enumerate(data):
         entry_path = f"pipeline[{idx}]"
         if not isinstance(entry, dict):
             raise ValidationError(f"{entry_path} must be a mapping.")
-        name = _require_str(entry, "name", f"{entry_path}.name")
-        _validate_no_spaces(name, f"{entry_path}.name")
-        name_norm = name.strip().lower()
-        _validate_enum(name_norm, CALCULATOR_TYPES_DEFAULT, f"{entry_path}.name")
-        steps = _optional_int(entry.get("steps"), f"{entry_path}.steps") or 10
-        fmax = _optional_float(entry.get("fmax"), f"{entry_path}.fmax") or 0.5
-        move = _parse_calculator_move(entry.get("move"), f"{entry_path}.move")
-        options_raw = entry.get("options", {})
-        if options_raw is None:
-            options_raw = {}
-        if not isinstance(options_raw, dict):
-            raise ValidationError(f"{entry_path}.options must be a mapping.")
-        calculator_factory = _build_calculator_factory(
-            name_norm,
-            options_raw,
-            entry_path,
+        stage_kwargs = dict(entry)
+        pipeline_id = _require_str(entry, "id", f"{entry_path}.id")
+        _validate_no_spaces(pipeline_id, f"{entry_path}.id")
+        if pipeline_id in pipeline_ids:
+            raise ValidationError(f"{entry_path}.id must be unique.")
+        pipeline_ids.add(pipeline_id)
+        action = _require_str(entry, "action", f"{entry_path}.action")
+        _validate_no_spaces(action, f"{entry_path}.action")
+        calc_name = entry.get("calc")
+        calculator_factory = _null_calculator_factory()
+        name_norm = ""
+        options_raw: dict[str, Any] = {}
+        if calc_name is not None:
+            calc_name = _ensure_str(calc_name, f"{entry_path}.calc")
+            if calc_name not in calculators:
+                raise ValidationError(
+                    f"{entry_path}.calc references undefined calculator '{calc_name}'."
+                )
+            calc_def = calculators[calc_name]
+            engine = calc_def.engine
+            _validate_no_spaces(engine, f"{entry_path}.calc")
+            name_norm = engine.strip().lower()
+            _validate_enum(name_norm, CALCULATOR_TYPES_DEFAULT, f"{entry_path}.calc")
+            options_raw = dict(calc_def.options)
+            calculator_factory = _build_calculator_factory(
+                name_norm,
+                options_raw,
+                entry_path,
+            )
+        steps = (
+            _optional_int(entry.get("steps"), f"{entry_path}.steps")
+            or DEFAULT_MAX_STEPS
         )
-        calculators.append(
-            CalculatorSettings(
+        fmax = _optional_float(entry.get("fmax"), f"{entry_path}.fmax") or 0.5
+        moves = _parse_pipeline_moves(entry.get("moves"), f"{entry_path}.moves")
+        filters = _parse_filters(entry.get("filters"), f"{entry_path}.filters")
+        for key in ("id", "action", "calc", "steps", "fmax", "moves", "filters"):
+            stage_kwargs.pop(key, None)
+        pipeline.append(
+            PipeStage(
+                id=pipeline_id,
+                action=action,
                 name=name_norm,
                 steps=steps,
                 fmax=fmax,
                 options=options_raw,
                 calculator_factory=calculator_factory,
-                move=move,
+                moves=moves,
+                filters=filters,
+                kwargs=stage_kwargs,
             )
         )
-    return calculators
+    return pipeline
+
+
+@dataclass(frozen=True)
+class FilterSpec:
+    name: str
+    args: dict[str, Any] = field(default_factory=dict)
+
+
+def _parse_filters(value: object, path: str) -> list[FilterSpec]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValidationError(f"{path} must be a list.")
+    filters: list[FilterSpec] = []
+    for idx, entry in enumerate(value):
+        entry_path = f"{path}[{idx}]"
+        if not isinstance(entry, dict):
+            raise ValidationError(f"{entry_path} must be a mapping.")
+        name = _require_str(entry, "name", f"{entry_path}.name")
+        args = entry.get("args", {})
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            raise ValidationError(f"{entry_path}.args must be a mapping.")
+        filters.append(FilterSpec(name=name, args=args))
+    return filters
+
+
+def _parse_calculator_definitions(
+    data: object,
+) -> dict[str, CalculatorDefinition]:
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValidationError("calculators must be a mapping.")
+
+    definitions: dict[str, CalculatorDefinition] = {}
+    for key, value in data.items():
+        if not isinstance(key, str):
+            raise ValidationError("calculators keys must be strings.")
+        entry_path = f"calculators.{key}"
+        if not isinstance(value, dict):
+            raise ValidationError(f"{entry_path} must be a mapping.")
+        engine = _require_str(value, "engine", f"{entry_path}.engine")
+        options_raw = value.get("options", {})
+        if options_raw is None:
+            options_raw = {}
+        if not isinstance(options_raw, dict):
+            raise ValidationError(f"{entry_path}.options must be a mapping.")
+        definitions[key] = CalculatorDefinition(engine=engine, options=options_raw)
+    return definitions
 
 
 def _build_calculator(
@@ -494,30 +623,104 @@ def _build_calculator_factory(
     return _factory
 
 
-def _parse_calculator_move(
-    value: object,
-    path: str,
-) -> Literal[False] | dict[str, float | str]:
-    if value is None or value is False:
-        return False
-    if value is True:
-        raise ValidationError(f"{path} must be false or a mapping.")
+def _parse_pipeline_moves(value: object, path: str) -> list[MoveSettings]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValidationError(f"{path} must be a list.")
+
+    moves: list[MoveSettings] = []
+    move_ids: set[str] = set()
+    for idx, entry in enumerate(value):
+        entry_path = f"{path}[{idx}]"
+        if not isinstance(entry, dict):
+            raise ValidationError(f"{entry_path} must be a mapping.")
+        move_id = _require_str(entry, "id", f"{entry_path}.id")
+        _validate_no_spaces(move_id, f"{entry_path}.id")
+        if move_id in move_ids:
+            raise ValidationError(f"{entry_path}.id must be unique.")
+        move_ids.add(move_id)
+        kind = _require_str(entry, "kind", f"{entry_path}.kind")
+        _validate_enum(kind, {"pair_pull", "tether_pull"}, f"{entry_path}.kind")
+        pair = _parse_move_pair(entry.get("pair"), f"{entry_path}.pair")
+        k = _optional_int(entry.get("k"), f"{entry_path}.k") or 100
+
+        target = None
+        offset = None
+        if kind == "pair_pull":
+            target = _parse_move_target(entry.get("target"), f"{entry_path}.target")
+            if "offset" in entry:
+                raise ValidationError(
+                    f"{entry_path}.offset is not allowed for pair_pull."
+                )
+        else:
+            offset = _parse_move_offset(entry.get("offset"), f"{entry_path}.offset")
+            if "target" in entry:
+                raise ValidationError(
+                    f"{entry_path}.target is not allowed for tether_pull."
+                )
+
+        moves.append(
+            MoveSettings(
+                id=move_id,
+                kind=kind,
+                pair=pair,
+                k=k,
+                target=target,
+                offset=offset,
+            )
+        )
+    return moves
+
+
+def _parse_move_pair(value: object, path: str) -> MovePair:
     if not isinstance(value, dict):
-        raise ValidationError(f"{path} must be false or a mapping.")
-    start = _optional_float_or_auto(value.get("start"), f"{path}.start")
-    target = _optional_float_or_auto(value.get("target"), f"{path}.target")
-    step = _optional_float_or_auto(value.get("step"), f"{path}.step")
-    return {"start": start, "target": target, "step": step}
+        raise ValidationError(f"{path} must be a mapping.")
+    a = _require_str(value, "a", f"{path}.a")
+    b = _require_str(value, "b", f"{path}.b")
+    return MovePair(a=a, b=b)
+
+
+def _parse_move_target(value: object, path: str) -> MoveTarget:
+    if not isinstance(value, dict):
+        raise ValidationError(f"{path} must be a mapping.")
+    start = _require_float_or_auto(value, "from", f"{path}.from")
+    end = _require_float_or_auto(value, "to", f"{path}.to")
+    step = _require_float_or_auto(value, "step", f"{path}.step")
+    return MoveTarget(start=start, end=end, step=step)
+
+
+def _parse_move_offset(value: object, path: str) -> MoveOffset:
+    if not isinstance(value, dict):
+        raise ValidationError(f"{path} must be a mapping.")
+    start = _require_float_or_auto(value, "from", f"{path}.from")
+    end = _require_float(value, "to", f"{path}.to")
+    step = _require_float(value, "step", f"{path}.step")
+    if isinstance(end, str) and end == "auto":
+        raise ValidationError(f"{path}.to must be a number, not 'auto'.")
+    return MoveOffset(start=start, end=end, step=step)
 
 
 def _optional_float_or_auto(value: object, path: str) -> float | str:
     if value is None:
-        raise ValidationError(f"{path} is required when move is a mapping.")
+        raise ValidationError(f"{path} is required when move entry is a mapping.")
     if isinstance(value, str):
         if value != "auto":
             raise ValidationError(f"{path} must be a number or 'auto'.")
         return value
     return _ensure_float(value, path)
+
+
+def _require_float_or_auto(data: dict, key: str, path: str) -> float | str:
+    if key not in data:
+        raise ValidationError(f"Missing required field: {path}")
+    return _optional_float_or_auto(data[key], path)
+
+
+def _require_float(data: dict, key: str, path: str) -> float:
+    if key not in data:
+        raise ValidationError(f"Missing required field: {path}")
+    return _ensure_float(data[key], path)
 
 
 def _parse_bond_formation(data: object) -> Optional[BondFormationSettings]:
@@ -858,12 +1061,3 @@ def _validate_enum(value: str, allowed: set[str], path: str) -> None:
 def _validate_no_spaces(value: str, path: str) -> None:
     if any(ch.isspace() for ch in value):
         raise ValidationError(f"{path} must not contain spaces.")
-
-
-# Example usage:
-# from reaction_parser import load_reaction_from_file
-#
-# definition = load_reaction_from_file("reaction.yaml")
-# print(definition.reaction.name)
-# for reactant in definition.reactants:
-#     print(reactant.id, reactant.type)
