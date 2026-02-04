@@ -44,8 +44,8 @@ class PipelineContext:
         os.makedirs(path, exist_ok=True)
         return path
 
-    def stage_step_dir(self, stage_id: str, step_id: str) -> str:
-        path = os.path.join(self.stage_dir(stage_id), step_id)
+    def stage_step_dir(self, stage_dir: str, step_id: str) -> str:
+        path = os.path.join(stage_dir, step_id)
         if os.path.exists(path):
             shutil.rmtree(path)
         os.makedirs(path, exist_ok=True)

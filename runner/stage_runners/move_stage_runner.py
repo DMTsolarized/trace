@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 import os
-from ase.io import write
-
+import re
+from ase.io import read, write
+from runner.pipeline_context import PipelineContext
 from runner.reaction_parser import MoveSettings, MoveTarget, MoveOffset
 from runner.candidate_pool import Candidate, CandidatePool
 from runner.stage_runners.base_stage_runner import StageRunner
@@ -18,6 +19,8 @@ from ase import Atoms
 
 
 class MoveStageRunner(StageRunner):
+    _STEP_RE = re.compile(r"_step_(\d+)\.xyz$")
+
     def run(self) -> None:
         calculator_factory = self.context.calculator_factories.get(self.stage.id)
         if calculator_factory is None or not self.stage.moves:
@@ -26,16 +29,26 @@ class MoveStageRunner(StageRunner):
             self.context.pool, calculator_factory, self.stage.moves
         )
 
+    def end(self) -> None:
+        super().end()
+        if not self.stage.kwargs.get("nominate_ts"):
+            return
+        self._write_ts_guesses()
+
     def _apply_moves(
         self,
         pool: CandidatePool,
         calculator_factory,
         moves: list[MoveSettings],
     ) -> CandidatePool:
-        step_dir = self.context.stage_step_dir(self.stage.id, "step")
         new_candidates: list[Candidate] = []
+        self.energy_by_candidate: list[dict[str, float]] = []
         for candidate_idx, candidate in enumerate(list(pool)):
+            step_dir = self.context.stage_step_dir(
+                self.dir, f"candidate_{candidate_idx}"
+            )
             current_atoms = candidate.atoms
+            energy_by_file: dict[str, float] = {}
             move_specs = _prepare_move_specs(self.context, moves, current_atoms)
             max_len = max(len(spec.path) for spec in move_specs)
             _normalize_paths(move_specs, max_len)
@@ -84,7 +97,9 @@ class MoveStageRunner(StageRunner):
                 filename = f"cand_{candidate_idx}_step_{step_idx}.xyz"
                 write_path = os.path.join(step_dir, filename)
                 write(write_path, worker)
+                energy_by_file[write_path] = float(worker.get_total_energy())
                 current_atoms = worker
+            self.energy_by_candidate.append(energy_by_file)
             new_candidates.append(
                 Candidate(
                     atoms=current_atoms,
@@ -95,7 +110,32 @@ class MoveStageRunner(StageRunner):
             # TODO: add proper way to replace candidates (filters maybe or similar), for now we just replace with last point (but we might not want to)
         return CandidatePool(new_candidates)
 
+    def _write_ts_guesses(self) -> None:
+        if not hasattr(self, "energy_by_candidate"):
+            return
+        ts_dir = os.path.join(self.dir, "ts-guesses")
+        os.makedirs(ts_dir, exist_ok=True)
+        for candidate_idx, energy_by_file in enumerate(self.energy_by_candidate):
+            if not energy_by_file:
+                continue
+            best_path = max(energy_by_file.items(), key=lambda item: item[1])[0]
+            try:
+                atoms = read(best_path)
+            except Exception:
+                continue
+            step_match = self._STEP_RE.search(os.path.basename(best_path))
+            step_suffix = step_match.group(1) if step_match else "unknown"
+            out_path = os.path.join(
+                ts_dir, f"candidate_{candidate_idx}_ts_guess_step{step_suffix}.xyz"
+            )
+            """IMPORTANT TODO: this is a RESTRAINED!! ts_guess basically we force stuff to be together > add orca gate possibility
+                to check engrad and see if chemistry actually runs. for Pd we got engrad < 0.03 Eh/bor so good for cutoff but 
+                maybe if it were > 0.03 we relax it to 0.05 via ase optimizer
+            """
+            write(out_path, atoms)
 
+
+# TODO: clean up separately in runner folder/utils and so on
 def _resolve_pair_pull(
     target: MoveTarget, atoms: Atoms, i: int, j: int
 ) -> tuple[float, float, float]:
@@ -136,7 +176,7 @@ class _MoveSpec:
 
 
 def _prepare_move_specs(
-    context, moves: list[MoveSettings], atoms: Atoms
+    context: PipelineContext, moves: list[MoveSettings], atoms: Atoms
 ) -> list[_MoveSpec]:
     specs: list[_MoveSpec] = []
     for move in moves:
