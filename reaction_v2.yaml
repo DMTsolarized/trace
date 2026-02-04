@@ -91,14 +91,15 @@ pipeline:
     action: walk
     calc: gfn1
     steps: 100
-    fmax: 0.3
+    fmax: 0.05
+    nominate_ts: true
     moves:
       - id: pull-ipso-c
         kind: pair_pull
         pair:
           a: catalyst:0
           b: substrate:1
-        k: 20
+        k: 10
         target:
           from: auto
           to: auto
@@ -108,7 +109,7 @@ pipeline:
         pair:
           a: catalyst:0
           b: substrate:0
-        k: 20
+        k: 10
         target:
           from: auto
           to: auto
@@ -118,7 +119,7 @@ pipeline:
         pair:
           a: substrate:1
           b: substrate:0
-        k: 20
+        k: 10
         offset:
           from: auto
           to: 2.9

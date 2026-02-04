@@ -25,6 +25,7 @@ class HarmonicBond(FixConstraint):
         # harmonic: U = 1/2 k (r - rt)^2  ->  F = -k (r - rt) e
         fmag = -self.k * (r - self.rt)
         fvec = fmag * e
+        # Maybe force only? makes no sense chemically though since forces should act on both
         if self._type == "atoms":
             forces[self.a2] += fvec
             forces[self.a1] -= fvec
